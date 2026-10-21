@@ -15,6 +15,7 @@ struct lsm_blob_sizes bbg_blob_sizes __ro_after_init = {
 	.lbs_cred = sizeof(struct bbg_cred_security_struct),
 };
 #else
+/* Remove this if you have selinux_cred defined in objsec.h */
 static inline struct task_security_struct *selinux_cred(const struct cred *cred)
 {
 	return cred->security;
@@ -36,6 +37,28 @@ void bb_cred_transfer(struct cred *new, const struct cred *old)
 	struct bbg_cred_security_struct *tsec = bbg_cred(new);
 
 	*tsec = *old_tsec;
+}
+
+/*
+ * Root-domain secid cache.  A domain such as "u:r:ksu:s0" only exists in the
+ * policy after KernelSU's ksud injects it, which happens long after the first
+ * execve() of boot; caching a failed security_secctx_to_secid() lookup forever
+ * (as -EINVAL) made every root process look trusted, so the guard never
+ * denied anything.  Only cache successful lookups and retry failures at a
+ * low rate until the domain shows up in the policy.
+ */
+#define BBG_SID_RETRY_INTERVAL 256
+static unsigned long bbg_exec_nr;
+
+static void bbg_resolve_domain_sid(int *cached_sid, const char *ctx)
+{
+	u32 sid;
+
+	if (likely(*cached_sid >= 0))
+		return;
+	if (*cached_sid != -EINVAL || !(bbg_exec_nr % BBG_SID_RETRY_INTERVAL))
+		*cached_sid = security_secctx_to_secid(ctx, strlen(ctx), &sid)
+			      ? -EINVAL : (int)sid;
 }
 
 int bb_bprm_set_creds(struct linux_binprm *bprm)
@@ -66,23 +89,11 @@ int bb_bprm_set_creds(struct linux_binprm *bprm)
 
 	if (unlikely(!selinux_initialized_compat())) return 0; // we keep this only for module scripts, i don't want hook execve
 
-	if (su_sid == -1) { // root impl compatible
-		if (security_secctx_to_secid("u:r:su:s0", strlen("u:r:su:s0"), &su_sid)) {
-			su_sid = -EINVAL;
-		}
-	}
-
-	if (magisk_sid == -1) {
-		if (security_secctx_to_secid("u:r:magisk:s0", strlen("u:r:magisk:s0"), &magisk_sid) != 0) {
-			magisk_sid = -EINVAL;
-		}
-	}
-
-	if (ksu_sid == -1) {
-                if (security_secctx_to_secid("u:r:ksu:s0", strlen("u:r:ksu:s0"), &ksu_sid) != 0) {
-                        ksu_sid = -EINVAL;
-                }
-        }
+	bbg_exec_nr++;
+	/* root impl compatible (su/magisk/ksu domains) */
+	bbg_resolve_domain_sid(&su_sid, "u:r:su:s0");
+	bbg_resolve_domain_sid(&magisk_sid, "u:r:magisk:s0");
+	bbg_resolve_domain_sid(&ksu_sid, "u:r:ksu:s0");
 
 	if (unlikely(
 		old_selinux_tsec->sid == su_sid || old_selinux_tsec->osid == su_sid || // kernelsu old
