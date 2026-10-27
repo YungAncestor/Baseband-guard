@@ -15,7 +15,6 @@ struct lsm_blob_sizes bbg_blob_sizes __ro_after_init = {
 	.lbs_cred = sizeof(struct bbg_cred_security_struct),
 };
 #else
-/* Remove this if you have selinux_cred defined in objsec.h */
 static inline struct task_security_struct *selinux_cred(const struct cred *cred)
 {
 	return cred->security;
