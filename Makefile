@@ -42,6 +42,15 @@ ifeq ($(shell grep -q "file_ioctl_compat" $(srctree)/include/linux/lsm_hook_defs
     $(info -- Baseband-guard/compat: found file_ioctl_compat)
 endif
 
+# file_open hook signature: (struct file *file, const struct cred *cred) on
+# kernels < 5.7, (struct file *file) on >= 5.7.  Grep both declaration styles
+# (struct member in lsm_hooks.h, LSM_HOOK in lsm_hook_defs.h); the head -1
+# form tolerates a missing lsm_hook_defs.h on pre-5.1 trees.
+ifneq ($(shell grep -hE '(file_open, struct file \*file, const struct cred \*cred)|(\(\*file_open\)\(struct file \*file, const struct cred \*cred\))' $(srctree)/include/linux/lsm_hook_defs.h $(srctree)/include/linux/lsm_hooks.h 2>/dev/null | head -1),)
+    ccflags-y += -DBBG_FILE_OPEN_HAS_CRED
+    $(info -- Baseband-guard/compat: file_open hook takes (file, cred))
+endif
+
 ifeq ($(shell grep -q "selinux_state" $(srctree)/security/selinux/include/security.h 2>/dev/null && echo true),true)
     ccflags-y += -DBB_HAS_SELINUX_STATE
     $(info -- Baseband-guard/compat: found selinux_state)

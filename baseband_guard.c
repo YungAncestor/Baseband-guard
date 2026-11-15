@@ -12,6 +12,8 @@
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/hashtable.h>
+#include <linux/major.h>
+#include <linux/mman.h>
 
 #include "kernel_compat.h"
 #include "baseband_guard.h"
@@ -19,26 +21,64 @@
 #include "blkdev_helper.h"
 
 struct device_hash_node { dev_t dev; struct hlist_node h; };
-DEFINE_HASHTABLE(allowed_devs, 7);
+static DEFINE_HASHTABLE(allowed_devs, 7);
+static DEFINE_SPINLOCK(allowed_devs_lock);
 
 static bool allow_has(dev_t dev)
 {
 	struct device_hash_node *p;
+	bool found = false;
+	unsigned long flags;
 
-	hash_for_each_possible(allowed_devs, p, h, (u64)dev)
-		if (p->dev == dev) return true;
-	return false;
+	spin_lock_irqsave(&allowed_devs_lock, flags);
+	hash_for_each_possible(allowed_devs, p, h, (u64)dev) {
+		if (p->dev == dev) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&allowed_devs_lock, flags);
+	return found;
 }
 
 static void allow_add(dev_t dev)
 {
 	struct device_hash_node *n;
-	if (!dev || allow_has(dev)) return;
+	struct device_hash_node *p_dup;
+	bool dup = false;
+	unsigned long flags;
+
+	if (!dev) return;
 	n = kmalloc(sizeof(*n), GFP_ATOMIC);
 	if (!n) return;
 	n->dev = dev;
-	hash_add(allowed_devs, &n->h, (u64)dev);
+	INIT_HLIST_NODE(&n->h);
+
+	spin_lock_irqsave(&allowed_devs_lock, flags);
+	hash_for_each_possible(allowed_devs, p_dup, h, (u64)dev) {
+		if (p_dup->dev == dev) { dup = true; break; }
+	}
+	if (!dup)
+		hash_add(allowed_devs, &n->h, (u64)dev);
+	spin_unlock_irqrestore(&allowed_devs_lock, flags);
+
+	if (dup) {
+		kfree(n);
+		return;
+	}
 	bb_pr("allow-cache dev %u:%u\n", MAJOR(dev), MINOR(dev));
+}
+
+/*
+ * Raw SCSI passthrough devices (/dev/sgN): an untrusted process can issue
+ * WRITE(10)/UNMAP/FORMAT UNIT against any LUN with a plain SG_IO ioctl or a
+ * write(), which never touches a block device inode.  They are char devices,
+ * so treat write access to them like a write to a protected partition.
+ * (bsg char devices use a dynamic major and stay uncovered for now.)
+ */
+static bool bbg_is_raw_scsi_inode(struct inode *inode)
+{
+	return S_ISCHR(inode->i_mode) && imajor(inode) == SCSI_GENERIC_MAJOR;
 }
 
 static bool is_zram_device(dev_t dev)
@@ -101,13 +141,13 @@ static void bbg_log_deny_detail(const char *why, struct file *file, struct inode
 		bbg_get_cmdline(cmdbuf, CMD_BUFLEN);
 
 	if (cmd_opt) {
-		pr_info(
+		pr_info_ratelimited(
 			"baseband_guard: deny %s cmd=0x%x dev=%u:%u path=%s pid=%d comm=%s argv=\"%s\"\n",
 			why, cmd_opt, MAJOR(dev), MINOR(dev),
 			path ? path : "?", current->pid, current->comm,
 			cmdbuf ? cmdbuf : "?");
 	} else {
-		pr_info(
+		pr_info_ratelimited(
 			"baseband_guard: deny %s dev=%u:%u path=%s pid=%d comm=%s argv=\"%s\"\n",
 			why, MAJOR(dev), MINOR(dev),
 			path ? path : "?", current->pid, current->comm,
@@ -137,12 +177,71 @@ static int bb_file_permission(struct file *file, int mask)
 	if (!file) return 0;
 
 	inode = file_inode(file);
-	if (likely(!S_ISBLK(inode->i_mode))) return 0;
+	if (likely(!S_ISBLK(inode->i_mode) && !bbg_is_raw_scsi_inode(inode)))
+		return 0;
 
 	if (allow_has(inode->i_rdev) || reverse_allow_match_and_cache(inode->i_rdev))
 		return 0;
 
 	return deny("write to protected partition", file, inode, 0);
+}
+
+/*
+ * Block write access at open() time as well.  file_permission() only fires on
+ * read/write syscalls, so without this hook an untrusted process can open a
+ * protected device O_RDWR (open() checks no BBG hook) and keep the fd around.
+ * A read-only open stays allowed.
+ */
+#ifdef BBG_FILE_OPEN_HAS_CRED
+static int bb_file_open(struct file *file, const struct cred *cred)
+#else
+static int bb_file_open(struct file *file)
+#endif
+{
+	struct inode *inode;
+
+	if (!file) return 0;
+	inode = file_inode(file);
+
+	if (likely(!S_ISBLK(inode->i_mode) && !bbg_is_raw_scsi_inode(inode)))
+		return 0;
+
+	if (likely(current_process_trusted()))
+		return 0;
+
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		return 0;
+
+	if (allow_has(inode->i_rdev) || reverse_allow_match_and_cache(inode->i_rdev))
+		return 0;
+
+	return deny("write-open on protected device", file, inode, 0);
+}
+
+/*
+ * Writable mmap is a full bypass of the write path: block devices support
+ * generic_file_mmap(), and a shared writable mapping writes sectors from the
+ * fault path, which never calls security_file_permission().  Close it at
+ * mmap() time.  MAP_PRIVATE|PROT_WRITE is copy-on-write and cannot reach the
+ * device, but for a protected partition we fail closed on PROT_WRITE anyway.
+ */
+static int bb_file_mmap(struct file *file, unsigned long reqprot,
+			unsigned long prot, unsigned long flags)
+{
+	struct inode *inode;
+
+	if (!file) return 0;
+	inode = file_inode(file);
+	if (likely(!S_ISBLK(inode->i_mode))) return 0;
+	if (likely(current_process_trusted())) return 0;
+
+	if (!(prot & PROT_WRITE))
+		return 0;
+
+	if (allow_has(inode->i_rdev) || reverse_allow_match_and_cache(inode->i_rdev))
+		return 0;
+
+	return deny("writable mmap on protected partition", file, inode, 0);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
@@ -166,26 +265,34 @@ static int bb_inode_setattr(struct dentry *dentry, struct iattr *iattr)
 	return deny("setattr on protected partition", 0, inode, 0);
 }
 
-static inline bool is_destructive_ioctl(unsigned int cmd)
+/*
+ * Default-deny for untrusted processes on protected devices: allow only
+ * read-only queries, deny every other ioctl, including the destructive ones
+ * (BLKDISCARD, BLKZEROOUT, BLKRRPART, ...), raw SCSI passthrough (SG_IO --
+ * WRITE(10)/UNMAP/FORMAT UNIT against any LBA), NVMe admin/io passthrough
+ * (format/sanitize) and zoned-blk resets (BLKRESETZONE).  A blacklist can
+ * never be complete; passthrough ioctls let an attacker invent new commands
+ * faster than the list can follow.
+ */
+static inline bool is_query_ioctl(unsigned int cmd)
 {
 	switch (cmd) {
-	case BLKDISCARD:
-	case BLKSECDISCARD:
-	case BLKZEROOUT:
-#ifdef BLKPG
-	case BLKPG:
+	case BLKROGET:
+	case BLKGETSIZE:
+	case BLKGETSIZE64:
+	case BLKSSZGET:
+	case BLKBSZGET:
+	case BLKPBSZGET:
+	case BLKALIGNOFF:
+	case BLKIOMIN:
+	case BLKIOOPT:
+	case BLKSECTGET:
+	case BLKROTATIONAL:
+#ifdef BLKDISCARDZEROES
+	case BLKDISCARDZEROES:
 #endif
-#ifdef BLKTRIM
-	case BLKTRIM:
-#endif
-#ifdef BLKRRPART
-	case BLKRRPART:
-#endif
-#ifdef BLKSETRO
-	case BLKSETRO:
-#endif
-#ifdef BLKSETBADSECTORS
-	case BLKSETBADSECTORS:
+#ifdef BLKGETDISKSEQ
+	case BLKGETDISKSEQ:
 #endif
 		return true;
 	default:
@@ -201,16 +308,16 @@ static int bb_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	inode = file_inode(file);
 	if (likely(!S_ISBLK(inode->i_mode))) return 0;
 
-	if (!is_destructive_ioctl(cmd))
-		return 0;
-
 	if (likely(current_process_trusted()))
 		return 0;
 
 	if (allow_has(inode->i_rdev) || reverse_allow_match_and_cache(inode->i_rdev))
 		return 0;
 
-	return deny("destructive ioctl on protected partition", file, inode, cmd);
+	if (is_query_ioctl(cmd))
+		return 0;
+
+	return deny("ioctl on protected partition", file, inode, cmd);
 }
 
 #ifdef BB_HAS_IOCTL_COMPAT
@@ -226,6 +333,8 @@ extern int bb_cred_prepare(struct cred *new, const struct cred *old, gfp_t gfp);
 
 static struct security_hook_list bb_hooks[] = {
 	LSM_HOOK_INIT(file_permission,      bb_file_permission),
+	LSM_HOOK_INIT(file_open,            bb_file_open),
+	LSM_HOOK_INIT(mmap_file,            bb_file_mmap),
 	LSM_HOOK_INIT(file_ioctl,           bb_file_ioctl),
 	LSM_HOOK_INIT(inode_setattr, 		bb_inode_setattr),
 
