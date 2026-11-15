@@ -51,6 +51,19 @@ ifneq ($(shell grep -hE '(file_open, struct file \*file, const struct cred \*cre
     $(info -- Baseband-guard/compat: file_open hook takes (file, cred))
 endif
 
+# kernel_read_file hook: (file, id) on kernels < 5.9, gains `bool contents`
+# on >= 5.9.  kernel_load_data (init_module from memory) only exists >= 5.8;
+# on < 5.8 init_module already goes through kernel_read_file(NULL,
+# READING_MODULE).  grep -A2 spans the multi-line LSM_HOOK(...) entries.
+ifeq ($(shell grep -A2 "kernel_read_file" $(srctree)/include/linux/lsm_hook_defs.h $(srctree)/include/linux/lsm_hooks.h 2>/dev/null | grep -q "bool contents" && echo true),true)
+    ccflags-y += -DBBG_HAS_KERNEL_READ_FILE
+    $(info -- Baseband-guard/compat: kernel_read_file takes (file, id, contents))
+endif
+ifeq ($(shell grep -q "kernel_load_data" $(srctree)/include/linux/lsm_hook_defs.h $(srctree)/include/linux/lsm_hooks.h 2>/dev/null && echo true),true)
+    ccflags-y += -DBBG_HAS_KERNEL_LOAD_DATA
+    $(info -- Baseband-guard/compat: kernel_load_data hook present)
+endif
+
 ifeq ($(shell grep -q "selinux_state" $(srctree)/security/selinux/include/security.h 2>/dev/null && echo true),true)
     ccflags-y += -DBB_HAS_SELINUX_STATE
     $(info -- Baseband-guard/compat: found selinux_state)

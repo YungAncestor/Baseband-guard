@@ -14,6 +14,11 @@
 #include <linux/hashtable.h>
 #include <linux/major.h>
 #include <linux/mman.h>
+/* READING_MODULE/LOADING_MODULE enums: <linux/fs.h> on < 5.8,
+ * <linux/kernel_read_file.h> on >= 5.8. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+#include <linux/kernel_read_file.h>
+#endif
 
 #include "kernel_compat.h"
 #include "baseband_guard.h"
@@ -331,12 +336,61 @@ extern int bb_bprm_set_creds(struct linux_binprm *bprm);
 extern void bb_cred_transfer(struct cred *new, const struct cred *old);
 extern int bb_cred_prepare(struct cred *new, const struct cred *old, gfp_t gfp);
 
+/*
+ * Block module loading from untrusted processes.  A KPM is kernel code:
+ * it can bypass every LSM hook in this file by writing sectors directly
+ * through the bio layer, or patch BBG's own deny() out of the kernel.
+ * Deny at the LSM boundary instead of trying to out-patch it.
+ *
+ * 4.14: only kernel_read_file exists; init_module() (memory blob) also calls
+ *   security_kernel_read_file(NULL, READING_MODULE), so one hook covers both.
+ * 5.1+: kernel_read_file gains a `contents` param and a separate
+ *   kernel_load_data hook (init_module) is added.
+ */
+#ifdef BBG_HAS_KERNEL_LOAD_DATA
+static int bb_kernel_load_data(enum kernel_load_data_id id, bool contents)
+#else
+static int bb_kernel_read_file(struct file *file, enum kernel_read_file_id id)
+#endif
+{
+	if (likely(current_process_trusted()))
+		return 0;
+
+#ifdef BBG_HAS_KERNEL_LOAD_DATA
+	if (id != LOADING_MODULE)
+		return 0;
+#else
+	if (id != READING_MODULE)
+		return 0;
+#endif
+
+	return deny("module load from untrusted process", NULL, NULL, 0);
+}
+
+#ifdef BBG_HAS_KERNEL_READ_FILE
+static int bb_kernel_read_file(struct file *file,
+				enum kernel_read_file_id id, bool contents)
+{
+	if (likely(current_process_trusted()))
+		return 0;
+
+	if (id != READING_MODULE)
+		return 0;
+
+	return deny("module load from untrusted process", NULL, NULL, 0);
+}
+#endif
+
 static struct security_hook_list bb_hooks[] = {
 	LSM_HOOK_INIT(file_permission,      bb_file_permission),
 	LSM_HOOK_INIT(file_open,            bb_file_open),
 	LSM_HOOK_INIT(mmap_file,            bb_file_mmap),
 	LSM_HOOK_INIT(file_ioctl,           bb_file_ioctl),
 	LSM_HOOK_INIT(inode_setattr, 		bb_inode_setattr),
+#ifdef BBG_HAS_KERNEL_LOAD_DATA
+	LSM_HOOK_INIT(kernel_load_data, 	bb_kernel_load_data),
+#endif
+	LSM_HOOK_INIT(kernel_read_file, 	bb_kernel_read_file),
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,8,0)
 	LSM_HOOK_INIT(bprm_creds_for_exec,  bb_bprm_set_creds),
